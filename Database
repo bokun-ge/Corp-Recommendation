@@ -1,0 +1,8 @@
+Database
+
+import kagglehub
+
+# Download latest version
+path = kagglehub.dataset_download("srisahithis/bitcoin-ohlcv-data-20192024-multi-timeframe")
+
+print("Path to dataset files:", path)
