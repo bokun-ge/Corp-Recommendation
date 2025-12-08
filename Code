@@ -1,0 +1,184 @@
+# src/data_prep.py
+import pandas as pd
+import numpy as np
+
+def load_btc_data(csv_path: str) -> pd.DataFrame:
+    """
+    Load BTC OHLCV data from CSV. Assumes columns like:
+    ['timestamp', 'open', 'high', 'low', 'close', 'volume'] or similar.
+    """
+    df = pd.read_csv(csv_path)
+    # Try to identify a datetime column
+    for col in ['timestamp', 'date', 'time']:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col])
+            df = df.sort_values(col)
+            df = df.set_index(col)
+            break
+    return df
+
+
+def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add simple TA features: returns, moving averages, RSI-like feature, volatility.
+    This is simple but enough for explainability demo.
+    """
+    df = df.copy()
+
+    close = df['close']
+
+    # Log return
+    df['ret_1'] = np.log(close / close.shift(1))
+
+    # Moving averages
+    df['ma_10'] = close.rolling(window=10).mean()
+    df['ma_50'] = close.rolling(window=50).mean()
+
+    # Momentum (close - close_N)
+    df['mom_10'] = close - close.shift(10)
+
+    # Rolling volatility (std of returns)
+    df['vol_10'] = df['ret_1'].rolling(window=10).std()
+
+    # "RSI-like" feature: ratio of positive returns
+    up = df['ret_1'].clip(lower=0)
+    down = -df['ret_1'].clip(upper=0)
+    roll_up = up.rolling(14).mean()
+    roll_down = down.rolling(14).mean()
+    rs = roll_up / (roll_down + 1e-9)
+    df['rsi_14'] = 100 - (100 / (1 + rs))
+
+    # Target: next-period direction (1 = up, 0 = down / flat)
+    df['ret_fwd_1'] = df['ret_1'].shift(-1)
+    df['target_up'] = (df['ret_fwd_1'] > 0).astype(int)
+
+    df = df.dropna()
+    return df
+
+
+def train_test_split_time(df: pd.DataFrame, feature_cols: list, target_col: str, split_ratio=0.8):
+    """
+    Time-based train/test split.
+    """
+    n = len(df)
+    split_idx = int(n * split_ratio)
+    train = df.iloc[:split_idx]
+    test = df.iloc[split_idx:]
+
+    X_train = train[feature_cols].values
+    y_train = train[target_col].values
+    X_test = test[feature_cols].values
+    y_test = test[target_col].values
+
+    return X_train, X_test, y_train, y_test, train, test
+
+
+if __name__ == "__main__":
+    df_raw = load_btc_data("../data/btc_ohlcv.csv")
+    df_feat = add_technical_indicators(df_raw)
+    print(df_feat.head())
+    print("Rows:", len(df_feat))
+
+# src/train_model.py
+import joblib
+import os
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.metrics import classification_report, roc_auc_score
+from data_prep import load_btc_data, add_technical_indicators, train_test_split_time
+
+FEATURE_COLS = [
+    "ret_1",
+    "ma_10",
+    "ma_50",
+    "mom_10",
+    "vol_10",
+    "rsi_14",
+]
+
+TARGET_COL = "target_up"
+
+def main():
+    df_raw = load_btc_data(os.path.join("data", "btc_ohlcv.csv"))
+    df = add_technical_indicators(df_raw)
+
+    X_train, X_test, y_train, y_test, train_df, test_df = train_test_split_time(
+        df, FEATURE_COLS, TARGET_COL, split_ratio=0.8
+    )
+
+    model = GradientBoostingClassifier(
+        n_estimators=200,
+        learning_rate=0.05,
+        max_depth=3,
+        random_state=42
+    )
+    model.fit(X_train, y_train)
+
+    y_pred = model.predict(X_test)
+    y_proba = model.predict_proba(X_test)[:, 1]
+
+    print("Classification report:\n", classification_report(y_test, y_pred))
+    try:
+        print("ROC AUC:", roc_auc_score(y_test, y_proba))
+    except ValueError:
+        print("ROC AUC could not be computed (only one class in test)")
+
+    os.makedirs("models", exist_ok=True)
+    joblib.dump(model, os.path.join("models", "gbm_btc_direction.pkl"))
+
+    print("Model saved to models/gbm_btc_direction.pkl")
+
+
+if __name__ == "__main__":
+    main()
+
+# src/explain_shap.py
+import os
+import joblib
+import shap
+import matplotlib.pyplot as plt
+from data_prep import load_btc_data, add_technical_indicators, train_test_split_time, FEATURE_COLS, TARGET_COL
+
+def main():
+    df_raw = load_btc_data(os.path.join("data", "btc_ohlcv.csv"))
+    df = add_technical_indicators(df_raw)
+
+    X_train, X_test, y_train, y_test, train_df, test_df = train_test_split_time(
+        df, FEATURE_COLS, TARGET_COL, split_ratio=0.8
+    )
+
+    model = joblib.load(os.path.join("models", "gbm_btc_direction.pkl"))
+
+    # TreeExplainer for tree-based models (fast & exact)
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X_test)
+
+    # Global feature importance (mean |SHAP|)
+    shap.summary_plot(
+        shap_values,
+        X_test,
+        feature_names=FEATURE_COLS,
+        show=False
+    )
+    plt.title("SHAP Feature Importance - BTC Direction Model")
+    os.makedirs("plots", exist_ok=True)
+    plt.savefig(os.path.join("plots", "shap_summary.png"), bbox_inches="tight", dpi=200)
+    plt.close()
+
+    # Local explanation for one example
+    idx = 10
+    shap.force_plot(
+        explainer.expected_value,
+        shap_values[idx, :],
+        feature_names=FEATURE_COLS,
+        matplotlib=True,
+        show=False
+    )
+    plt.title(f"SHAP Force Plot - Example idx={idx}")
+    plt.savefig(os.path.join("plots", "shap_force_example.png"), bbox_inches="tight", dpi=200)
+    plt.close()
+
+    print("SHAP plots saved in plots/ folder.")
+
+
+if __name__ == "__main__":
+    main()
