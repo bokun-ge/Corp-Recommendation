@@ -11,8 +11,6 @@ Crypto markets are highly volatile and difficult to interpret. This project appl
 - Generate explanations using SHAP, Integrated Gradients, and Attention  
 - Improve transparency, trust, and risk understanding  
 
-##  Repository Structure
-(Insert structure from above)
 
 ##  Methods Used
 - **SHAP** for global + local feature importance  
