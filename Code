@@ -1,196 +1,487 @@
-pandas
-numpy
-matplotlib
-scikit-learn
-shap
-torch
-torchvision
-torchaudio
-tqdm
 
+"""
+Crop Recommendation Machine Learning Project
+Author: Bokun Ge
 
+This script performs the full machine learning workflow for a crop recommendation project:
+1. Load dataset
+2. Explore and clean data
+3. Visualize data
+4. Split data into train/test sets
+5. Train multiple classification models
+6. Tune key models
+7. Evaluate performance
+8. Save charts and model results
 
-# src/data_prep.py
-import pandas as pd
+Dataset:
+Crop Recommendation Dataset from Kaggle
+https://www.kaggle.com/datasets/atharvaingle/crop-recommendation-dataset
+
+Expected CSV filename:
+Crop_recommendation.csv
+
+Required columns:
+N, P, K, temperature, humidity, ph, rainfall, label
+"""
+
+# =========================
+# 1. Import Libraries
+# =========================
+
+import os
+from pathlib import Path
+
 import numpy as np
-
-def load_btc_data(csv_path: str) -> pd.DataFrame:
-    """
-    Load BTC OHLCV data from CSV. Assumes columns like:
-    ['timestamp', 'open', 'high', 'low', 'close', 'volume'] or similar.
-    """
-    df = pd.read_csv(csv_path)
-    # Try to identify a datetime column
-    for col in ['timestamp', 'date', 'time']:
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col])
-            df = df.sort_values(col)
-            df = df.set_index(col)
-            break
-    return df
-
-
-def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add simple TA features: returns, moving averages, RSI-like feature, volatility.
-    This is simple but enough for explainability demo.
-    """
-    df = df.copy()
-
-    close = df['close']
-
-    # Log return
-    df['ret_1'] = np.log(close / close.shift(1))
-
-    # Moving averages
-    df['ma_10'] = close.rolling(window=10).mean()
-    df['ma_50'] = close.rolling(window=50).mean()
-
-    # Momentum (close - close_N)
-    df['mom_10'] = close - close.shift(10)
-
-    # Rolling volatility (std of returns)
-    df['vol_10'] = df['ret_1'].rolling(window=10).std()
-
-    # "RSI-like" feature: ratio of positive returns
-    up = df['ret_1'].clip(lower=0)
-    down = -df['ret_1'].clip(upper=0)
-    roll_up = up.rolling(14).mean()
-    roll_down = down.rolling(14).mean()
-    rs = roll_up / (roll_down + 1e-9)
-    df['rsi_14'] = 100 - (100 / (1 + rs))
-
-    # Target: next-period direction (1 = up, 0 = down / flat)
-    df['ret_fwd_1'] = df['ret_1'].shift(-1)
-    df['target_up'] = (df['ret_fwd_1'] > 0).astype(int)
-
-    df = df.dropna()
-    return df
-
-
-def train_test_split_time(df: pd.DataFrame, feature_cols: list, target_col: str, split_ratio=0.8):
-    """
-    Time-based train/test split.
-    """
-    n = len(df)
-    split_idx = int(n * split_ratio)
-    train = df.iloc[:split_idx]
-    test = df.iloc[split_idx:]
-
-    X_train = train[feature_cols].values
-    y_train = train[target_col].values
-    X_test = test[feature_cols].values
-    y_test = test[target_col].values
-
-    return X_train, X_test, y_train, y_test, train, test
-
-
-if __name__ == "__main__":
-    df_raw = load_btc_data("../data/btc_ohlcv.csv")
-    df_feat = add_technical_indicators(df_raw)
-    print(df_feat.head())
-    print("Rows:", len(df_feat))
-
-# src/train_model.py
-import joblib
-import os
-from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.metrics import classification_report, roc_auc_score
-from data_prep import load_btc_data, add_technical_indicators, train_test_split_time
-
-FEATURE_COLS = [
-    "ret_1",
-    "ma_10",
-    "ma_50",
-    "mom_10",
-    "vol_10",
-    "rsi_14",
-]
-
-TARGET_COL = "target_up"
-
-def main():
-    df_raw = load_btc_data(os.path.join("data", "btc_ohlcv.csv"))
-    df = add_technical_indicators(df_raw)
-
-    X_train, X_test, y_train, y_test, train_df, test_df = train_test_split_time(
-        df, FEATURE_COLS, TARGET_COL, split_ratio=0.8
-    )
-
-    model = GradientBoostingClassifier(
-        n_estimators=200,
-        learning_rate=0.05,
-        max_depth=3,
-        random_state=42
-    )
-    model.fit(X_train, y_train)
-
-    y_pred = model.predict(X_test)
-    y_proba = model.predict_proba(X_test)[:, 1]
-
-    print("Classification report:\n", classification_report(y_test, y_pred))
-    try:
-        print("ROC AUC:", roc_auc_score(y_test, y_proba))
-    except ValueError:
-        print("ROC AUC could not be computed (only one class in test)")
-
-    os.makedirs("models", exist_ok=True)
-    joblib.dump(model, os.path.join("models", "gbm_btc_direction.pkl"))
-
-    print("Model saved to models/gbm_btc_direction.pkl")
-
-
-if __name__ == "__main__":
-    main()
-
-# src/explain_shap.py
-import os
-import joblib
-import shap
+import pandas as pd
 import matplotlib.pyplot as plt
-from data_prep import load_btc_data, add_technical_indicators, train_test_split_time, FEATURE_COLS, TARGET_COL
 
-def main():
-    df_raw = load_btc_data(os.path.join("data", "btc_ohlcv.csv"))
-    df = add_technical_indicators(df_raw)
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
 
-    X_train, X_test, y_train, y_test, train_df, test_df = train_test_split_time(
-        df, FEATURE_COLS, TARGET_COL, split_ratio=0.8
-    )
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.svm import SVC
 
-    model = joblib.load(os.path.join("models", "gbm_btc_direction.pkl"))
-
-    # TreeExplainer for tree-based models (fast & exact)
-    explainer = shap.TreeExplainer(model)
-    shap_values = explainer.shap_values(X_test)
-
-    # Global feature importance (mean |SHAP|)
-    shap.summary_plot(
-        shap_values,
-        X_test,
-        feature_names=FEATURE_COLS,
-        show=False
-    )
-    plt.title("SHAP Feature Importance - BTC Direction Model")
-    os.makedirs("plots", exist_ok=True)
-    plt.savefig(os.path.join("plots", "shap_summary.png"), bbox_inches="tight", dpi=200)
-    plt.close()
-
-    # Local explanation for one example
-    idx = 10
-    shap.force_plot(
-        explainer.expected_value,
-        shap_values[idx, :],
-        feature_names=FEATURE_COLS,
-        matplotlib=True,
-        show=False
-    )
-    plt.title(f"SHAP Force Plot - Example idx={idx}")
-    plt.savefig(os.path.join("plots", "shap_force_example.png"), bbox_inches="tight", dpi=200)
-    plt.close()
-
-    print("SHAP plots saved in plots/ folder.")
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    classification_report,
+    confusion_matrix,
+    ConfusionMatrixDisplay
+)
 
 
-if __name__ == "__main__":
-    main()
+# =========================
+# 2. Project Settings
+# =========================
+
+DATA_PATH = "Crop_recommendation.csv"
+OUTPUT_DIR = Path("crop_project_outputs")
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+RANDOM_STATE = 42
+TEST_SIZE = 0.20
+
+
+# =========================
+# 3. Load Dataset
+# =========================
+
+def load_dataset(path: str) -> pd.DataFrame:
+    """
+    Load the crop recommendation dataset.
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Dataset file not found: {path}\n"
+            "Please download the Kaggle Crop Recommendation Dataset and place "
+            "Crop_recommendation.csv in the same folder as this script."
+        )
+
+    df = pd.read_csv(path)
+    return df
+
+
+df = load_dataset(DATA_PATH)
+
+print("Dataset loaded successfully.")
+print("Dataset shape:", df.shape)
+print("\nFirst five rows:")
+print(df.head())
+
+
+# =========================
+# 4. Data Exploration
+# =========================
+
+print("\nDataset information:")
+print(df.info())
+
+print("\nSummary statistics:")
+print(df.describe())
+
+print("\nMissing values:")
+print(df.isnull().sum())
+
+print("\nCrop class distribution:")
+print(df["label"].value_counts())
+
+
+# =========================
+# 5. Data Cleaning
+# =========================
+
+# Drop duplicate rows if any exist.
+duplicates = df.duplicated().sum()
+print("\nDuplicate rows:", duplicates)
+
+df = df.drop_duplicates()
+
+# Confirm required columns exist.
+required_columns = ["N", "P", "K", "temperature", "humidity", "ph", "rainfall", "label"]
+
+missing_required_columns = [col for col in required_columns if col not in df.columns]
+if missing_required_columns:
+    raise ValueError(f"Missing required columns: {missing_required_columns}")
+
+# Separate features and target.
+X = df[["N", "P", "K", "temperature", "humidity", "ph", "rainfall"]]
+y = df["label"]
+
+
+# =========================
+# 6. Exploratory Visualizations
+# =========================
+
+# 6.1 Class Distribution
+plt.figure(figsize=(12, 6))
+df["label"].value_counts().sort_index().plot(kind="bar")
+plt.title("Crop Class Distribution")
+plt.xlabel("Crop Type")
+plt.ylabel("Number of Records")
+plt.xticks(rotation=90)
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / "class_distribution.png", dpi=300)
+plt.close()
+
+# 6.2 Correlation Heatmap
+correlation = X.corr()
+
+plt.figure(figsize=(9, 7))
+plt.imshow(correlation, aspect="auto")
+plt.colorbar()
+plt.xticks(range(len(correlation.columns)), correlation.columns, rotation=45)
+plt.yticks(range(len(correlation.columns)), correlation.columns)
+plt.title("Feature Correlation Heatmap")
+
+for i in range(len(correlation.columns)):
+    for j in range(len(correlation.columns)):
+        plt.text(j, i, f"{correlation.iloc[i, j]:.2f}", ha="center", va="center")
+
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / "correlation_heatmap.png", dpi=300)
+plt.close()
+
+
+# =========================
+# 7. Train/Test Split
+# =========================
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X,
+    y,
+    test_size=TEST_SIZE,
+    random_state=RANDOM_STATE,
+    stratify=y
+)
+
+print("\nTraining set shape:", X_train.shape)
+print("Testing set shape:", X_test.shape)
+
+
+# =========================
+# 8. Model Selection
+# =========================
+
+models = {
+    "Decision Tree": DecisionTreeClassifier(random_state=RANDOM_STATE),
+    "Random Forest": RandomForestClassifier(random_state=RANDOM_STATE),
+    "K-Nearest Neighbors": Pipeline([
+        ("scaler", StandardScaler()),
+        ("model", KNeighborsClassifier())
+    ]),
+    "Support Vector Machine": Pipeline([
+        ("scaler", StandardScaler()),
+        ("model", SVC(random_state=RANDOM_STATE))
+    ])
+}
+
+
+# =========================
+# 9. Train and Evaluate Models
+# =========================
+
+def evaluate_model(model, X_train, X_test, y_train, y_test):
+    """
+    Train a model and calculate common classification metrics.
+    """
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+
+    metrics = {
+        "Accuracy": accuracy_score(y_test, y_pred),
+        "Precision": precision_score(y_test, y_pred, average="weighted", zero_division=0),
+        "Recall": recall_score(y_test, y_pred, average="weighted", zero_division=0),
+        "F1 Score": f1_score(y_test, y_pred, average="weighted", zero_division=0)
+    }
+
+    return metrics, y_pred
+
+
+results = []
+predictions = {}
+
+for model_name, model in models.items():
+    metrics, y_pred = evaluate_model(model, X_train, X_test, y_train, y_test)
+    predictions[model_name] = y_pred
+
+    results.append({
+        "Model": model_name,
+        "Accuracy": metrics["Accuracy"],
+        "Precision": metrics["Precision"],
+        "Recall": metrics["Recall"],
+        "F1 Score": metrics["F1 Score"]
+    })
+
+results_df = pd.DataFrame(results).sort_values(by="Accuracy", ascending=False)
+
+print("\nModel comparison results:")
+print(results_df)
+
+results_df.to_csv(OUTPUT_DIR / "model_results.csv", index=False)
+
+
+# =========================
+# 10. Model Accuracy Chart
+# =========================
+
+plt.figure(figsize=(9, 5))
+plt.bar(results_df["Model"], results_df["Accuracy"])
+plt.title("Model Accuracy Comparison")
+plt.xlabel("Model")
+plt.ylabel("Accuracy")
+plt.ylim(0, 1.05)
+plt.xticks(rotation=30, ha="right")
+
+for i, value in enumerate(results_df["Accuracy"]):
+    plt.text(i, value + 0.01, f"{value:.3f}", ha="center")
+
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / "model_accuracy.png", dpi=300)
+plt.close()
+
+
+# =========================
+# 11. Hyperparameter Tuning
+# =========================
+
+# 11.1 Random Forest tuning
+rf_param_grid = {
+    "n_estimators": [100, 200, 300],
+    "max_depth": [None, 10, 20],
+    "min_samples_split": [2, 5]
+}
+
+rf_grid = GridSearchCV(
+    RandomForestClassifier(random_state=RANDOM_STATE),
+    rf_param_grid,
+    cv=5,
+    scoring="accuracy",
+    n_jobs=-1
+)
+
+rf_grid.fit(X_train, y_train)
+
+print("\nBest Random Forest parameters:")
+print(rf_grid.best_params_)
+print("Best Random Forest cross-validation accuracy:", rf_grid.best_score_)
+
+best_rf = rf_grid.best_estimator_
+
+
+# 11.2 KNN tuning
+knn_pipeline = Pipeline([
+    ("scaler", StandardScaler()),
+    ("model", KNeighborsClassifier())
+])
+
+knn_param_grid = {
+    "model__n_neighbors": [3, 5, 7, 9, 11],
+    "model__weights": ["uniform", "distance"]
+}
+
+knn_grid = GridSearchCV(
+    knn_pipeline,
+    knn_param_grid,
+    cv=5,
+    scoring="accuracy",
+    n_jobs=-1
+)
+
+knn_grid.fit(X_train, y_train)
+
+print("\nBest KNN parameters:")
+print(knn_grid.best_params_)
+print("Best KNN cross-validation accuracy:", knn_grid.best_score_)
+
+
+# 11.3 SVM tuning
+svm_pipeline = Pipeline([
+    ("scaler", StandardScaler()),
+    ("model", SVC(random_state=RANDOM_STATE))
+])
+
+svm_param_grid = {
+    "model__C": [0.1, 1, 10],
+    "model__kernel": ["linear", "rbf"],
+    "model__gamma": ["scale", "auto"]
+}
+
+svm_grid = GridSearchCV(
+    svm_pipeline,
+    svm_param_grid,
+    cv=5,
+    scoring="accuracy",
+    n_jobs=-1
+)
+
+svm_grid.fit(X_train, y_train)
+
+print("\nBest SVM parameters:")
+print(svm_grid.best_params_)
+print("Best SVM cross-validation accuracy:", svm_grid.best_score_)
+
+
+# =========================
+# 12. Final Model Evaluation
+# =========================
+
+# Select final model.
+# Random Forest is chosen because it usually performs strongly on tabular datasets
+# and provides feature importance for interpretation.
+final_model = best_rf
+final_model.fit(X_train, y_train)
+
+final_predictions = final_model.predict(X_test)
+
+print("\nFinal Model: Tuned Random Forest")
+print("\nFinal model classification report:")
+print(classification_report(y_test, final_predictions, zero_division=0))
+
+final_accuracy = accuracy_score(y_test, final_predictions)
+final_precision = precision_score(y_test, final_predictions, average="weighted", zero_division=0)
+final_recall = recall_score(y_test, final_predictions, average="weighted", zero_division=0)
+final_f1 = f1_score(y_test, final_predictions, average="weighted", zero_division=0)
+
+print("\nFinal model metrics:")
+print("Accuracy:", final_accuracy)
+print("Precision:", final_precision)
+print("Recall:", final_recall)
+print("F1 Score:", final_f1)
+
+
+# =========================
+# 13. Confusion Matrix
+# =========================
+
+labels = sorted(y.unique())
+
+cm = confusion_matrix(y_test, final_predictions, labels=labels)
+
+plt.figure(figsize=(14, 12))
+disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=labels)
+disp.plot(include_values=False, xticks_rotation=90)
+plt.title("Final Random Forest Confusion Matrix")
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / "confusion_matrix.png", dpi=300)
+plt.close()
+
+
+# =========================
+# 14. Feature Importance
+# =========================
+
+feature_importance = pd.DataFrame({
+    "Feature": X.columns,
+    "Importance": final_model.feature_importances_
+}).sort_values(by="Importance", ascending=False)
+
+print("\nFeature importance:")
+print(feature_importance)
+
+feature_importance.to_csv(OUTPUT_DIR / "feature_importance.csv", index=False)
+
+plt.figure(figsize=(8, 5))
+plt.bar(feature_importance["Feature"], feature_importance["Importance"])
+plt.title("Random Forest Feature Importance")
+plt.xlabel("Feature")
+plt.ylabel("Importance")
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / "feature_importance.png", dpi=300)
+plt.close()
+
+
+# =========================
+# 15. Example Prediction
+# =========================
+
+example_farmland = pd.DataFrame({
+    "N": [90],
+    "P": [42],
+    "K": [43],
+    "temperature": [20.87],
+    "humidity": [82.00],
+    "ph": [6.50],
+    "rainfall": [202.93]
+})
+
+recommended_crop = final_model.predict(example_farmland)[0]
+
+print("\nExample farmland input:")
+print(example_farmland)
+print("Recommended crop:", recommended_crop)
+
+
+# =========================
+# 16. Save Final Summary
+# =========================
+
+summary_text = f"""
+Crop Recommendation Machine Learning Project Summary
+
+Dataset:
+Crop Recommendation Dataset from Kaggle
+
+Features:
+N, P, K, temperature, humidity, pH, rainfall
+
+Target:
+Crop label
+
+Models Compared:
+Decision Tree
+Random Forest
+K-Nearest Neighbors
+Support Vector Machine
+
+Final Model:
+Tuned Random Forest
+
+Final Model Performance:
+Accuracy: {final_accuracy:.4f}
+Precision: {final_precision:.4f}
+Recall: {final_recall:.4f}
+F1 Score: {final_f1:.4f}
+
+Best Random Forest Parameters:
+{rf_grid.best_params_}
+
+Example Recommendation:
+{recommended_crop}
+
+Conclusion:
+The crop recommendation model can help farmers select crops that better match
+their soil and climate conditions. This supports more efficient agricultural planning,
+better resource use, and the broader goal of improving food security and reducing hunger.
+"""
+
+with open(OUTPUT_DIR / "project_summary.txt", "w", encoding="utf-8") as file:
+    file.write(summary_text)
+
+print("\nProject complete.")
+print(f"All output files were saved in: {OUTPUT_DIR.resolve()}")
